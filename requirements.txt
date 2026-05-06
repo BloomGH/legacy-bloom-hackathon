@@ -6,6 +6,11 @@ httpx>=0.27.0
 websockets>=12.0
 pydantic-settings>=2.2.0
 
+# Required by FastAPI to parse Twilio's form-encoded webhook bodies on
+# /twiml/answer and /twiml/status. Without it, app startup raises
+# RuntimeError before serving any traffic.
+python-multipart>=0.0.7
+
 # audioop-lts is a drop-in replacement for the deprecated audioop module (removed in Python 3.13)
 # Required for mulaw <-> PCM audio conversion (Twilio <-> ElevenLabs)
 audioop-lts>=0.2.1; python_version >= "3.13"
