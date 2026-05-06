@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.routers import calls, twiml
+from app.routers import calls, test_call, twiml
 from app.services.elevenlabs_service import get_or_create_agent
 from app.services.twilio_service import configure_inbound_webhook
 
@@ -73,6 +73,7 @@ app.add_middleware(
 
 app.include_router(calls.router)
 app.include_router(twiml.router)
+app.include_router(test_call.router)
 
 
 @app.get("/", tags=["health"])

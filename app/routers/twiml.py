@@ -31,8 +31,10 @@ from app.services.elevenlabs_service import (
     get_elevenlabs_ws_url,
     get_elevenlabs_ws_headers,
 )
+from app.services.balance_check import log_balances_after_call
 from app.services.post_call import send_post_call
 from app.services.severity import classify as classify_severity
+from app.services.status_relay import normalize_status, relay_status_to_portal
 from app.prompts.postpartum import render_first_message, render_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -130,6 +132,61 @@ async def twiml_answer(
   </Connect>
 </Response>"""
     return Response(content=twiml, media_type="application/xml")
+
+
+# ── Status callback ──────────────────────────────────────────────────────────
+
+
+@router.post("/status")
+async def twiml_status(
+    CallSid: str = Form(default=""),
+    CallStatus: str = Form(default=""),
+    CallDuration: str = Form(default=""),
+    SipResponseCode: str = Form(default=""),
+    AnsweredBy: str = Form(default=""),
+    ErrorCode: str = Form(default=""),
+    ErrorMessage: str = Form(default=""),
+    SequenceNumber: str = Form(default=""),
+    Timestamp: str = Form(default=""),
+    From: str = Form(default=""),
+    To: str = Form(default=""),
+):
+    """Twilio status callback — fires for each lifecycle transition.
+
+    Sequence: queued/initiated → ringing → in-progress → terminal
+    (completed | busy | no-answer | failed | canceled).
+
+    We log the raw event for ops and forward a normalized update to the
+    portal so the CallLog row tracks the live state. Returns 200 fast so
+    Twilio never queues retries.
+    """
+    normalized = normalize_status(CallStatus)
+    duration: int | None = None
+    if CallDuration.strip().isdigit():
+        duration = int(CallDuration)
+    seq: int | None = None
+    if SequenceNumber.strip().isdigit():
+        seq = int(SequenceNumber)
+
+    logger.info(
+        f"[STATUS] sid={CallSid} status={CallStatus!r}→{normalized} "
+        f"seq={seq} duration={duration} sip={SipResponseCode!r} "
+        f"answered_by={AnsweredBy!r} error={ErrorCode!r}/{ErrorMessage!r} "
+        f"to={To!r} from={From!r}"
+    )
+
+    await relay_status_to_portal(
+        call_sid=CallSid,
+        status=normalized,
+        duration_seconds=duration,
+        error_code=ErrorCode or None,
+        error_message=ErrorMessage or None,
+        sip_response_code=SipResponseCode or None,
+        answered_by=AnsweredBy or None,
+        sequence_number=seq,
+        timestamp=Timestamp or None,
+    )
+    return Response(status_code=204)
 
 
 # ── WebSocket bridge ──────────────────────────────────────────────────────────
@@ -268,10 +325,21 @@ async def media_stream_bridge(twilio_ws: WebSocket):
                             logger.info(f"Stream stopped: callSid={call_sid}")
                             break
 
-                except WebSocketDisconnect:
-                    logger.info("Twilio WebSocket disconnected")
+                except WebSocketDisconnect as e:
+                    logger.info(
+                        f"Twilio WebSocket disconnected (callSid={call_sid} "
+                        f"code={getattr(e, 'code', '?')} reason={getattr(e, 'reason', '')!r})"
+                    )
+                except websockets.ConnectionClosed as e:
+                    logger.warning(
+                        f"ElevenLabs WS closed mid-forward (callSid={call_sid} "
+                        f"code={e.code} reason={e.reason!r})"
+                    )
                 except Exception as e:
-                    logger.error(f"Error in Twilio→ElevenLabs task: {e}")
+                    logger.exception(
+                        f"Error in Twilio→ElevenLabs forwarder (callSid={call_sid}): "
+                        f"{type(e).__name__}: {e}"
+                    )
 
             # ── Task 2: ElevenLabs → Twilio ───────────────────────────────────
             async def forward_elevenlabs_to_twilio():
@@ -335,8 +403,16 @@ async def media_stream_bridge(twilio_ws: WebSocket):
                         elif msg_type == "error":
                             logger.error(f"ElevenLabs error: {msg}")
 
+                except websockets.ConnectionClosed as e:
+                    logger.warning(
+                        f"ElevenLabs WS closed (callSid={call_sid} "
+                        f"code={e.code} reason={e.reason!r})"
+                    )
                 except Exception as e:
-                    logger.error(f"Error in ElevenLabs→Twilio task: {e}")
+                    logger.exception(
+                        f"Error in ElevenLabs→Twilio forwarder (callSid={call_sid}): "
+                        f"{type(e).__name__}: {e}"
+                    )
 
             # ── Run both directions concurrently ──────────────────────────────
             await asyncio.gather(
@@ -344,8 +420,19 @@ async def media_stream_bridge(twilio_ws: WebSocket):
                 forward_elevenlabs_to_twilio(),
             )
 
+    except websockets.ConnectionClosed as e:
+        logger.warning(
+            f"ElevenLabs WS connect/close error (callSid={call_sid} "
+            f"code={e.code} reason={e.reason!r})"
+        )
+    except WebSocketDisconnect as e:
+        logger.info(
+            f"Twilio WS closed before stream started (code={getattr(e, 'code', '?')})"
+        )
     except Exception as e:
-        logger.error(f"WebSocket bridge error: {e}", exc_info=True)
+        logger.exception(
+            f"WebSocket bridge error (callSid={call_sid}): {type(e).__name__}: {e}"
+        )
     finally:
         logger.info(f"Call ended (callSid={call_sid})")
         # Area 2: classify severity + post the verdict to the Bloom portal.
@@ -364,3 +451,10 @@ async def media_stream_bridge(twilio_ws: WebSocket):
                 )
         except Exception as e:
             logger.warning(f"Post-call classification dispatch failed: {e}")
+
+        # Vendor-spend snapshot — never raise. Fires once per call regardless
+        # of whether the conversation produced a transcript.
+        try:
+            await log_balances_after_call(call_sid)
+        except Exception as e:
+            logger.warning(f"Balance check after call failed: {e}")

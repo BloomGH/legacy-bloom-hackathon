@@ -30,6 +30,10 @@ class Settings(BaseSettings):
         return f"{self.public_base_url}/twiml/answer"
 
     @property
+    def twiml_status_url(self) -> str:
+        return f"{self.public_base_url}/twiml/status"
+
+    @property
     def twiml_websocket_url(self) -> str:
         # Twilio Media Streams requires wss:// — swap http(s) scheme
         base = self.public_base_url.replace("https://", "wss://").replace("http://", "ws://")

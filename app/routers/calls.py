@@ -2,12 +2,20 @@
 POST /call/outbound — trigger an AI postpartum care call to a phone number.
 """
 
-from fastapi import APIRouter
+import logging
+
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, field_validator
 
-from app.services.twilio_service import initiate_call, configure_inbound_webhook
+from app.services.twilio_service import (
+    TwilioCallError,
+    initiate_call,
+    configure_inbound_webhook,
+)
 from app.state import call_metadata
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/call", tags=["calls"])
 
@@ -82,7 +90,24 @@ async def outbound_call(body: CallRequest):
     - ElevenLabs agent created (auto-created on first run)
     - Server accessible via a public URL (ngrok, Cloudflare Tunnel, etc.)
     """
-    result = initiate_call(body.to)
+    try:
+        result = initiate_call(body.to)
+    except TwilioCallError as e:
+        # Surface Twilio's error code/message to the caller (the backend portal)
+        # so the frontend can render a specific drop reason instead of a generic 500.
+        logger.warning(
+            f"/call/outbound rejected by Twilio: to={body.to} code={e.code} "
+            f"message={e.message!r} more_info={e.more_info!r}"
+        )
+        raise HTTPException(
+            status_code=502 if e.status >= 500 else 400,
+            detail={
+                "error": "twilio_rejected",
+                "twilio_code": e.code,
+                "message": e.message,
+                "more_info": e.more_info,
+            },
+        )
 
     call_metadata[result["call_sid"]] = {
         "patient_name": body.patient_name,
