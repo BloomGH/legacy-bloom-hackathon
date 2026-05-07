@@ -15,6 +15,6 @@ python-multipart>=0.0.7
 # Required for mulaw <-> PCM audio conversion (Twilio <-> ElevenLabs)
 audioop-lts>=0.2.1; python_version >= "3.13"
 
-# Optional — Area 2 post-call severity classifier uses Anthropic when
-# ANTHROPIC_API_KEY is set; falls back to rule-based scan otherwise.
-anthropic>=0.40.0
+# Optional — Area 2 post-call severity classifier uses OpenAI when
+# OPENAI_API_KEY is set; falls back to rule-based scan otherwise.
+openai>=1.40.0

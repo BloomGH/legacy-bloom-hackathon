@@ -20,10 +20,10 @@ class Settings(BaseSettings):
     # Bloom portal — post-call ingestion target (Area 2)
     portal_base_url: str = "http://localhost:8001"
 
-    # Anthropic — used for post-call severity classification.
+    # OpenAI — used for post-call severity classification.
     # Optional: if absent, severity falls back to rule-based detection.
-    anthropic_api_key: str = ""
-    anthropic_model: str = "claude-sonnet-4-6"
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o"
 
     @property
     def twiml_answer_url(self) -> str:

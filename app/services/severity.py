@@ -5,9 +5,9 @@ Takes a conversation transcript and the mother's onboarding context, returns a
 portal's `/api/calls/by-sid/{call_sid}/post-call` endpoint expects.
 
 Strategy:
-  - If `ANTHROPIC_API_KEY` is set, ask Claude to classify with the PRD §5
-    rubric. Deterministic enough for demo, with on-stage tunability via the
-    rubric's threshold language.
+  - If `OPENAI_API_KEY` is set, ask the configured OpenAI model to classify
+    with the PRD §5 rubric. Uses response_format=json_object so the output
+    is reliably valid JSON.
   - If no key is available, fall back to a rule-based classifier scanning for
     red-flag phrases (e.g. "soaking a pad", "thoughts of harm"). Never fails
     closed — always returns at least L1 routine.
@@ -164,50 +164,59 @@ def _rule_based(transcript: str, ctx: dict[str, Any] | None = None) -> dict[str,
     }
 
 
-# ── Anthropic-powered classifier ─────────────────────────────────────────────
+# ── OpenAI-powered classifier ────────────────────────────────────────────────
 
 
-async def _claude_classify(
+async def _openai_classify(
     transcript: str, ctx: dict[str, Any] | None = None
 ) -> dict[str, Any] | None:
-    if not settings.anthropic_api_key:
+    if not settings.openai_api_key:
         return None
     try:
-        from anthropic import AsyncAnthropic  # type: ignore[import-not-found]
+        from openai import AsyncOpenAI  # type: ignore[import-not-found]
     except ImportError:
-        logger.warning("anthropic SDK not installed; skipping Claude severity pass")
+        logger.warning("openai SDK not installed; skipping OpenAI severity pass")
         return None
 
-    client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
     ctx_blob = json.dumps(ctx or {}, default=str)[:1500]
     user_msg = (
         f"Mother context: {ctx_blob}\n\nTranscript:\n{transcript[:6000]}"
     )
+    # Reasoning models (gpt-5, o-series) consume the completion budget on hidden
+    # reasoning tokens. Without `reasoning_effort=minimal`, default effort burns
+    # ~600 tokens before producing visible output, returning an empty response.
+    # Older chat models (gpt-4o family) do not accept this parameter.
+    extra_params: dict[str, Any] = {}
+    if any(settings.openai_model.startswith(p) for p in ("gpt-5", "o1", "o3", "o4")):
+        extra_params["reasoning_effort"] = "minimal"
     try:
-        resp = await client.messages.create(
-            model=settings.anthropic_model,
-            max_tokens=600,
-            system=RUBRIC,
-            messages=[{"role": "user", "content": user_msg}],
+        resp = await client.chat.completions.create(
+            model=settings.openai_model,
+            messages=[
+                {"role": "system", "content": RUBRIC},
+                {"role": "user", "content": user_msg},
+            ],
+            response_format={"type": "json_object"},
+            max_completion_tokens=2000,
+            **extra_params,
         )
     except Exception as e:
-        logger.warning(f"Claude severity pass failed: {e}")
+        logger.warning(f"OpenAI severity pass failed: {e}")
         return None
 
-    text = "".join(getattr(b, "text", "") for b in resp.content)
-    # Extract first JSON object in the response.
-    m = re.search(r"\{.*\}", text, flags=re.S)
-    if not m:
-        logger.warning(f"Claude severity output did not contain JSON: {text[:200]}")
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        logger.warning("OpenAI severity output was empty")
         return None
     try:
-        parsed = json.loads(m.group(0))
+        parsed = json.loads(text)
     except json.JSONDecodeError as e:
-        logger.warning(f"Claude severity JSON parse failed: {e}")
+        logger.warning(f"OpenAI severity JSON parse failed: {e} — raw: {text[:200]}")
         return None
     sl = parsed.get("severity_level")
     if sl not in (1, 2, 3, 4):
-        logger.warning(f"Claude returned invalid severity_level: {sl}")
+        logger.warning(f"OpenAI returned invalid severity_level: {sl}")
         return None
     parsed.setdefault(
         "signals", {"physical": [], "mood": [], "feeding": [], "baby": [], "support": []}
@@ -223,10 +232,10 @@ async def classify(
 ) -> dict[str, Any]:
     """Always returns a populated PostCallIngest-shaped dict, even on error."""
     if transcript.strip():
-        verdict = await _claude_classify(transcript, ctx)
+        verdict = await _openai_classify(transcript, ctx)
         if verdict is not None:
             logger.info(
-                f"Severity (Claude): L{verdict.get('severity_level')} — "
+                f"Severity (OpenAI): L{verdict.get('severity_level')} — "
                 f"{verdict.get('summary', '')[:80]}"
             )
             return verdict
